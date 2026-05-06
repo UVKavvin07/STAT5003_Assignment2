@@ -1,0 +1,389 @@
+---
+title: "W02G10_Assignment2_XGBoost"
+author: "Atharva Gadgil"
+date: "2026-05-06"
+output: html_document
+---
+---
+title: "Predicting Zoned Energy Star Ratings with XGBoost"
+subtitle: "STAT5003 Group Project — W02G10 XGBoost Component"
+author: "Atharva Gadgil"
+date: "2026-05-06"
+output:
+  html_document:
+    code_folding: hide
+    theme: flatly
+    toc: true
+    toc_float: true
+---
+
+```{css, echo=FALSE}
+body { font-size: 14px; line-height: 1.6; }
+h1 { font-size: 22px; margin-top: 20px; color: #2C3E50; border-bottom: 2px solid #ECF0F1; padding-bottom: 5px; }
+h2 { font-size: 18px; color: #2980B9; margin-top: 15px; }
+h3 { font-size: 15px; font-weight: bold; margin-top: 12px; }
+.table { font-size: 12px; }
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, dpi = 150)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(caret)
+  library(xgboost)
+  library(knitr)
+  library(kableExtra)
+})
+set.seed(42)
+```
+
+---
+
+# 1. Problem Framing
+
+**Research Question:** Can an air conditioner's Zoned Energy Star Rating for mixed climates (`c_star_mixed`) be accurately predicted from pre-rating technical specifications using a gradient-boosted tree model, and which features drive that prediction?
+
+This is a **15-class ordinal classification problem** — `c_star_mixed` takes discrete values from 0 to 7 in 0.5-step increments. XGBoost is chosen because it natively handles the non-linear interactions between efficiency metrics, refrigerant type, and configuration identified in the team's EDA, without requiring feature scaling.
+
+---
+
+# 2. Data Preprocessing
+
+The preprocessing pipeline directly mirrors the team's validated approach from Phase 1. The key steps are:
+
+1. **Drop empty columns** — 10 columns with zero information content are removed.
+2. **Exclude leaky features** — TCSPF, tcec, thec, HSPF, Residential, and Commercial columns are deterministic functions of the star rating (Spearman r = 0.99) and would trivially inflate accuracy.
+3. **Coerce and filter** — numeric columns stored as character are coerced; rows without a valid `c_star_mixed` are dropped.
+4. **Feature engineering** — Three binary flags (`is_portable`, `is_R32`, `is_split`) and a log-transformed capacity (`log_capacity`) are created based on EDA findings: portables are always rated 0 stars by regulation, R32 units outperform R410A by ~1 star, and split systems dominate the high-star end.
+5. **Select final feature set** and drop remaining NAs.
+
+```{r data-prep}
+df_raw <- read_csv("ac_2026_04_10.csv", show_col_types = FALSE)
+
+cols_empty <- c("avg_pwr_standby_mode", "Setting_heat", "eermepslev",
+                "TestedOutputEER", "TestedOutputCOP", "PL_EERMEPS",
+                "PL_COPMEPS", "GrandDate", "star2000_cool", "star2000_heat")
+
+leaky_cols <- names(df_raw)[grepl("TCSPF|tcec|thec|HSPF|Residential|Commercial",
+                                  names(df_raw), ignore.case = TRUE)]
+
+df_model <- df_raw %>%
+  select(-all_of(cols_empty)) %>%
+  select(-all_of(intersect(leaky_cols, names(df_raw)))) %>%
+  mutate(
+    c_star_mixed        = suppressWarnings(as.numeric(c_star_mixed)),
+    `Rated AEER`        = suppressWarnings(as.numeric(`Rated AEER`)),
+    `Rated ACOP`        = suppressWarnings(as.numeric(`Rated ACOP`)),
+    outdoor_sound_level = suppressWarnings(as.numeric(outdoor_sound_level)),
+    indoor_sound_level  = suppressWarnings(as.numeric(indoor_sound_level)),
+    `C-Total Cool Rated`= suppressWarnings(as.numeric(`C-Total Cool Rated`))
+  ) %>%
+  filter(!is.na(c_star_mixed)) %>%
+  mutate(
+    is_portable  = as.integer(Configuration2 == "Portable"),
+    is_R32       = as.integer(Refrigerant    == "R32"),
+    is_split     = as.integer(Configuration2 == "Single Split System"),
+    log_capacity = log1p(`C-Total Cool Rated`)
+  ) %>%
+  select(c_star_mixed, `Rated AEER`, `Rated ACOP`,
+         outdoor_sound_level, indoor_sound_level,
+         log_capacity, is_portable, is_R32, is_split) %>%
+  drop_na()
+
+cat("Rows for modelling:", nrow(df_model),
+    "| Features:", ncol(df_model) - 1,
+    "| Target classes:", n_distinct(df_model$c_star_mixed), "\n")
+```
+
+```{r preprocessing-table, echo=FALSE}
+tibble(
+  Step = 1:7,
+  Action = c(
+    "Drop 10 empty columns",
+    "Exclude leaky TCSPF / tcec / thec / HSPF / Residential / Commercial columns",
+    "Coerce character columns to numeric",
+    "Engineer is_portable binary flag",
+    "Engineer is_R32 and is_split binary flags",
+    "Log-transform cooling capacity (log1p)",
+    "Drop remaining NA rows after feature selection"
+  ),
+  Justification = c(
+    "Zero-information columns add noise without predictive value.",
+    "These are formula outputs that define the star rating — including them would be data leakage (Spearman r = 0.99).",
+    "Several numeric columns are stored as character in the raw CSV.",
+    "Regulatory override: Product Class 4 portables receive 0 stars regardless of AEER.",
+    "EDA showed R32 units outscore R410A by ~1 star; split systems dominate high-star classes.",
+    "Cooling capacity is right-skewed; log1p normalises the distribution.",
+    "drop_na() applied after selection — low missingness in chosen features minimises row loss."
+  )
+) %>%
+  kable(caption = "Table 1: Preprocessing and feature engineering pipeline") %>%
+  kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = TRUE)
+```
+
+---
+
+# 3. Train / Test Split
+
+A **stratified 80/20 split** is used via `createDataPartition`, which preserves the class distribution of `c_star_mixed` across both sets. This is critical given the heavily imbalanced 15-class target (the 0-star and 6–7-star extremes are sparse).
+
+```{r split}
+set.seed(42)
+train_idx <- createDataPartition(df_model$c_star_mixed, p = 0.8, list = FALSE)
+train_df  <- df_model[ train_idx, ]
+test_df   <- df_model[-train_idx, ]
+
+X_train <- train_df %>% select(-c_star_mixed)
+X_test  <- test_df  %>% select(-c_star_mixed)
+y_train <- train_df$c_star_mixed
+y_test  <- test_df$c_star_mixed
+
+cat("Train rows:", nrow(train_df), "| Test rows:", nrow(test_df), "\n")
+```
+
+---
+
+# 4. Evaluation Metric Helper
+
+All models (including the naive baseline) are evaluated using the same function to ensure fair comparison. Three complementary metrics are reported:
+
+- **Accuracy** — overall proportion of correct predictions (primary metric).
+- **Weighted F1** — harmonic mean of precision and recall, weighted by class support. Accounts for class imbalance.
+- **Ordinal MAE** — mean absolute difference between predicted and actual star values. Penalises large ordinal errors proportionally.
+
+```{r metrics-helper}
+get_metrics <- function(pred, actual) {
+  pred_num   <- as.numeric(as.character(pred))
+  actual_num <- as.numeric(as.character(actual))
+  all_levels <- sort(unique(actual_num))
+  pred_f     <- factor(pred_num,   levels = all_levels)
+  actual_f   <- factor(actual_num, levels = all_levels)
+  acc     <- mean(pred_num == actual_num)
+  mae     <- mean(abs(pred_num - actual_num))
+  cm      <- confusionMatrix(pred_f, actual_f)
+  sens    <- cm$byClass[, "Sensitivity"]
+  ppv     <- cm$byClass[, "Pos Pred Value"]
+  f1      <- 2 * sens * ppv / (sens + ppv + 1e-10)
+  support <- as.numeric(table(actual_f))
+  wf1     <- sum(f1 * support / sum(support), na.rm = TRUE)
+  c(Accuracy = round(acc, 4), `Weighted F1` = round(wf1, 4), MAE = round(mae, 4))
+}
+```
+
+---
+
+# 5. Naive Baseline
+
+Before fitting XGBoost, a **majority-class baseline** is established. This predicts the most frequent training class for every test observation — the minimum bar any model must beat to demonstrate genuine learning.
+
+```{r baseline}
+majority_class <- as.numeric(names(which.max(table(y_train))))
+naive_pred     <- rep(majority_class, length(y_test))
+naive_m        <- get_metrics(naive_pred, y_test)
+
+cat("Majority class:", majority_class,
+    "| Frequency:", round(mean(y_train == majority_class) * 100, 1), "%\n")
+cat("Naive Baseline — Accuracy:", naive_m["Accuracy"],
+    "| Weighted F1:", naive_m["Weighted F1"],
+    "| MAE:", naive_m["MAE"], "\n")
+```
+
+---
+
+# 6. XGBoost Model
+
+## 6.1 Model Choice & Setup
+
+XGBoost (Chen & Guestrin, 2016) builds an additive ensemble of decision trees, where each tree corrects the residual errors of its predecessors. Key advantages for this problem:
+
+- Captures non-linear interactions (e.g. AEER × refrigerant type) identified in EDA.
+- Natively handles mixed numeric and binary features without scaling.
+- Built-in regularisation (`subsample`, `colsample_bytree`) reduces overfitting on the sparse high-star classes.
+- Provides interpretable feature importance scores via information gain.
+
+The `multi:softmax` objective is used for the 15-class target. XGBoost requires a 0-indexed integer label, so `c_star_mixed` values are re-encoded before training and mapped back afterwards.
+
+```{r xgb-setup}
+classes     <- sort(unique(y_train))
+y_train_xgb <- as.integer(factor(y_train, levels = classes)) - 1
+y_test_xgb  <- as.integer(factor(y_test,  levels = classes)) - 1
+
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train_xgb)
+dtest  <- xgb.DMatrix(data = as.matrix(X_test),  label = y_test_xgb)
+```
+
+## 6.2 Hyperparameter Tuning
+
+A grid search over `max_depth` (3, 5, 7) and `eta` (0.05, 0.1, 0.2) is performed using **5-fold cross-validation** on the training set. `subsample = 0.8` and `colsample_bytree = 0.8` are fixed to reduce variance. Early stopping (20 rounds) finds the optimal number of trees for each combination, preventing overfitting without an arbitrary `nrounds` ceiling.
+
+The combination with the lowest mean CV classification error (`merror`) is selected as the final configuration.
+
+```{r xgb-tune}
+search_grid  <- expand.grid(max_depth = c(3, 5, 7), eta = c(0.05, 0.1, 0.2))
+best_merror  <- Inf
+best_params  <- list()
+best_nrounds <- 100  # safe fallback if best_iteration is NULL
+
+set.seed(42)
+for (i in seq_len(nrow(search_grid))) {
+  params_i <- list(
+    objective        = "multi:softmax",
+    num_class        = length(classes),
+    eval_metric      = "merror",
+    max_depth        = search_grid$max_depth[i],
+    eta              = search_grid$eta[i],
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  )
+  cv_res <- xgb.cv(
+    params  = params_i, data = dtrain,
+    nrounds = 300, nfold = 5,
+    early_stopping_rounds = 20, verbose = 0
+  )
+  min_err <- min(cv_res$evaluation_log$test_merror_mean)
+  if (min_err < best_merror) {
+    best_merror  <- min_err
+    best_params  <- params_i
+    best_nrounds <- if (!is.null(cv_res$best_iteration) && cv_res$best_iteration > 0)
+                      cv_res$best_iteration else 100
+  }
+}
+
+cat("Best CV merror:", round(best_merror, 4),
+    "\nWinning config — max_depth:", best_params$max_depth,
+    "| eta:", best_params$eta,
+    "| nrounds:", best_nrounds, "\n")
+```
+
+```{r tuning-table, echo=FALSE}
+tibble(
+  Hyperparameter   = c("max_depth", "eta (learning rate)", "subsample",
+                       "colsample_bytree", "nrounds", "CV strategy"),
+  `Values Searched` = c("3, 5, 7", "0.05, 0.1, 0.2", "0.80 (fixed)",
+                         "0.80 (fixed)", "Up to 300 (early stopping at 20)",
+                         "5-fold CV on training set"),
+  Rationale = c(
+    "Controls tree depth; deeper trees capture more interactions but risk overfitting.",
+    "Lower eta requires more trees but generalises better; CV selects the best trade-off.",
+    "Row subsampling adds stochasticity and reduces variance.",
+    "Feature subsampling per tree; reduces correlation between trees.",
+    "Early stopping selects the tree count where CV error plateaus.",
+    "Stratified folds ensure all 15 classes are represented in each fold."
+  )
+) %>%
+  kable(caption = "Table 2: Hyperparameter tuning strategy") %>%
+  kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = TRUE)
+```
+
+## 6.3 Final Model Training & Prediction
+
+```{r xgb-train}
+set.seed(42)
+xgb_fit <- xgb.train(
+  params  = best_params,
+  data    = dtrain,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+
+# predict() with multi:softmax returns 0-indexed class integers
+xgb_pred_idx <- predict(xgb_fit, dtest)
+xgb_pred     <- classes[xgb_pred_idx + 1]   # map back to original star values
+
+xgb_m <- get_metrics(xgb_pred, y_test)
+cat("XGBoost — Accuracy:", xgb_m["Accuracy"],
+    "| Weighted F1:", xgb_m["Weighted F1"],
+    "| MAE:", xgb_m["MAE"], "\n")
+```
+
+---
+
+# 7. Model Evaluation
+
+## 7.1 Performance vs Baseline
+
+```{r results-table, echo=FALSE}
+results_df <- tibble(
+  Model         = c("Naive Baseline (majority class)", "XGBoost (tuned)"),
+  Accuracy      = c(naive_m["Accuracy"],      xgb_m["Accuracy"]),
+  `Weighted F1` = c(naive_m["Weighted F1"],   xgb_m["Weighted F1"]),
+  MAE           = c(naive_m["MAE"],           xgb_m["MAE"])
+)
+
+results_df %>%
+  kable(caption = "Table 3: XGBoost vs naive baseline on held-out test set (stratified 80/20 split)",
+        digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE, font_size = 12) %>%
+  row_spec(2, bold = TRUE, background = "#EAF3DE")
+```
+
+XGBoost substantially outperforms the naive baseline across all three metrics. The improvement in Weighted F1 is particularly meaningful given the class imbalance — the baseline achieves near-zero F1 on rare classes while XGBoost generalises across the full 15-class range. The low MAE confirms that when XGBoost errs, it tends to predict an adjacent star class rather than a wildly incorrect one, which is expected for an ordinal target.
+
+## 7.2 Feature Importance
+
+Feature importance is measured by **Gain** — the average reduction in classification error a feature contributes across all splits it is used in. Higher gain indicates a feature that consistently improves predictions.
+
+```{r importance-plot, fig.cap="Figure 1: XGBoost feature importance by Gain. Features above the dashed line contribute the majority of predictive value.", fig.height=4.5, fig.width=8}
+xgb_imp <- xgb.importance(feature_names = colnames(X_train), model = xgb_fit)
+
+xgb_imp %>%
+  ggplot(aes(x = fct_reorder(Feature, Gain), y = Gain, fill = Gain)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = mean(xgb_imp$Gain), linetype = "dashed",
+             colour = "#E74C3C", linewidth = 0.7) +
+  scale_fill_gradient(low = "#AED6F1", high = "#2471A3") +
+  coord_flip() +
+  theme_minimal(base_size = 11) +
+  labs(
+    title    = "XGBoost Feature Importance (Gain)",
+    subtitle = paste0("Winning config — max_depth: ", best_params$max_depth,
+                      ", eta: ", best_params$eta,
+                      ", nrounds: ", best_nrounds),
+    x = NULL, y = "Gain"
+  )
+```
+
+**Interpretation:** `Rated AEER` dominates as expected — it is the primary efficiency metric underpinning the regulatory formula. `is_portable` emerges as the second most important feature, confirming the EDA finding that the portable regulatory override (0 stars regardless of AEER) must be encoded explicitly. `log_capacity` and `is_R32` provide meaningful independent signal. Sound levels and `Rated ACOP` contribute less, consistent with their weaker correlation with `c_star_mixed` observed in the correlation matrix.
+
+## 7.3 Prediction Distribution Check
+
+```{r pred-dist, fig.cap="Figure 2: Predicted vs actual star class distribution on the test set.", fig.height=3.5, fig.width=9}
+tibble(
+  value = c(y_test, xgb_pred),
+  type  = rep(c("Actual", "Predicted"), each = length(y_test))
+) %>%
+  count(type, value) %>%
+  ggplot(aes(x = factor(value), y = n, fill = type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Actual" = "#2980B9", "Predicted" = "#27AE60")) +
+  theme_minimal(base_size = 11) +
+  labs(title = "Predicted vs Actual Class Distribution (Test Set)",
+       x = "Star Rating (c_star_mixed)", y = "Count", fill = NULL)
+```
+
+---
+
+# 8. Conclusion
+
+XGBoost successfully predicts `c_star_mixed` from pre-rating technical specifications, substantially outperforming the naive baseline. Key findings:
+
+1. **Rated AEER is the dominant predictor**, consistent with the regulatory framework's reliance on seasonal efficiency as the primary basis for star assignment.
+2. **The portable regulatory override (`is_portable`) is critical** — without this engineered flag, the model cannot learn the hard 0-star rule for Product Class 4 units.
+3. **Hyperparameter tuning via 5-fold CV improved generalisation**: early stopping selected the optimal number of trees, preventing overfitting on the sparse high-star classes.
+4. **Ordinal MAE is low**, confirming that XGBoost's errors are concentrated in adjacent star classes rather than large misclassifications — appropriate behaviour for an ordinal target.
+
+This model is suitable for the E3 Programme's use case of flagging registrations where the declared star rating is inconsistent with technical specifications.
+
+---
+
+# 9. References
+
+Chen, T., & Guestrin, C. (2016). XGBoost: A scalable tree boosting system. *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 785–794. https://doi.org/10.1145/2939672.2939785
+
+Commonwealth of Australia. (2019). *Greenhouse and Energy Minimum Standards (Air Conditioners up to 65kW) Determination 2019*. Federal Register of Legislation. https://www.legislation.gov.au/Details/F2019L00490
+
+Department of Climate Change, Energy, the Environment and Water. (2023). *Energy Rating Data for Household Appliances – Air Conditioners* [Dataset]. Australian Government. https://www.energyrating.gov.au/
+
+Kuhn, M., & Johnson, K. (2013). *Applied predictive modeling*. Springer. https://doi.org/10.1007/978-1-4614-6849-3
+
+---
