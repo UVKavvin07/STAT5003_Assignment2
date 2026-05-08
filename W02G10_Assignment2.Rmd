@@ -389,23 +389,21 @@ We acknowledge the use of Claude Sonnet 4.6 (Anthropic, https://claude.ai) to as
 All preprocessing steps follows  directly from the EDA findings: leaky TCSPF columns are excluded (Spearman r = 0.99), cooling capacity is log-transformed due to right skew (Figure 2B), and the portable paradox necessitates a dedicated binary flag.
 
 ```{r preprocessing}
-# ── Step 1 & 2: Drop leaky and empty columns ─────────────────────────────────
+# Step 1 & 2: Drop leaky and empty columns
 leaky_cols <- names(df)[grepl("TCSPF|tcec|thec|HSPF|Residential|Commercial",
                                names(df), ignore.case = TRUE)]
 
 df_model <- df %>%
   select(-all_of(intersect(leaky_cols, names(df)))) %>%
   filter(!is.na(c_star_mixed)) %>%
-
-  # ── Step 3: Feature engineering from EDA insights ──────────────────────────
+  # Step 3: Feature engineering from EDA insights
   mutate(
-    is_portable  = as.integer(Configuration2 == "Portable"),       # regulatory override
-    is_R32       = as.integer(Refrigerant    == "R32"),            # thermodynamic advantage
+    is_portable  = as.integer(Configuration2 == "Portable"),
+    is_R32       = as.integer(Refrigerant    == "R32"),
     is_split     = as.integer(Configuration2 == "Single Split System"),
-    log_capacity = log1p(`C-Total Cool Rated`)                     # corrects right skew
+    log_capacity = log1p(`C-Total Cool Rated`)
   ) %>%
-
-  # ── Step 4: Select final feature set ───────────────────────────────────────
+  # Step 4: Select final feature set
   select(
     c_star_mixed,
     `Rated AEER`, `Rated ACOP`,
@@ -413,11 +411,26 @@ df_model <- df %>%
     log_capacity,
     is_portable, is_R32, is_split
   ) %>%
-  drop_na()
+  # Step 5: Median-impute numeric predictors (matches Section 5.1 plan).
+  # Only drop rows still missing the core efficiency or capacity features,
+  # which are the actual predictors of the star rating.
+  mutate(
+    outdoor_sound_level = ifelse(is.na(outdoor_sound_level),
+                                 median(outdoor_sound_level, na.rm = TRUE),
+                                 outdoor_sound_level),
+    indoor_sound_level  = ifelse(is.na(indoor_sound_level),
+                                 median(indoor_sound_level,  na.rm = TRUE),
+                                 indoor_sound_level)
+  ) %>%
+  filter(!is.na(`Rated AEER`),
+         !is.na(`Rated ACOP`),
+         !is.na(log_capacity))
 
 cat("Rows available for modelling:", nrow(df_model), "\n")
 cat("Features used:", ncol(df_model) - 1, "\n")
 cat("Target classes:", n_distinct(df_model$c_star_mixed), "\n")
+cat("Class distribution:\n")
+print(table(df_model$c_star_mixed))
 ```
 
 ```{r train-test-split}
@@ -575,17 +588,139 @@ xgb_m    <- get_metrics(xgb_pred, y_test)
 
 ## 3.7 k-Nearest Neighbours
 
-```{r model-knn}
-# set.seed(42)
-# knn_raw      <- knn(train=X_train_sc, test=X_test_sc, cl=factor(y_train), k=7)
-# knn_pred_num <- as.numeric(as.character(knn_raw))
-# knn_m        <- get_metrics(knn_pred_num, y_test)
-# cat("KNN  | Accuracy:", knn_m["Accuracy"], "| Weighted F1:", knn_m["Weighted F1"], "| MAE:", knn_m["MAE"], "\n")
+We picked KNN as the non-parametric baseline for the comparison. It makes no assumption about the shape of the boundary between classes and just checks whether nearby air conditioners tend to share the same star. That suits the diagnostic question we wanted to answer after EDA: given the heavy class overlap visible in Figure 3A, does the engineered feature space actually pull star classes apart locally, or do most neighbourhoods just collapse into the majority 3 to 3.5 star band?
 
-# Placeholder so report knits until section is complete
-knn_pred_num <- rep(median(y_test), length(y_test))
-knn_m        <- get_metrics(knn_pred_num, y_test)
+### 3.7.1 Tuning k with 10-fold CV
+
+For plain KNN with Euclidean distance on standardised features, k is effectively the only knob. Setting it too low (k = 1, 3) fits the noise from the few high-star units; setting it too high washes everything into the modal class. We swept odd values of k from 1 to 31 (odd to avoid tied votes when 15 classes are in play) using 10-fold cross-validation, restricted to the training set so the test split stays untouched.
+
+```{r model-knn-tune, fig.cap="**Figure 5:** 10-fold CV accuracy across candidate k. Shaded band is ±1 SD across folds. The dashed line marks the value carried into the final fit.", fig.height=3.8, fig.width=8}
+set.seed(42)
+
+# caret expects valid R names on the factor levels
+y_train_lab <- factor(make.names(as.character(y_train)))
+
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = FALSE,
+  savePredictions = "final"
+)
+
+# Odd k only, so 15-class majority votes can't tie
+k_grid <- data.frame(k = seq(1, 31, by = 2))
+
+knn_cv <- train(
+  x         = as.data.frame(X_train_sc),
+  y         = y_train_lab,
+  method    = "knn",
+  trControl = ctrl,
+  tuneGrid  = k_grid,
+  metric    = "Accuracy"
+)
+
+best_k <- knn_cv$bestTune$k
+
+knn_cv$results %>%
+  ggplot(aes(x = k, y = Accuracy)) +
+  geom_ribbon(aes(ymin = Accuracy - AccuracySD,
+                  ymax = Accuracy + AccuracySD),
+              fill = "#16A085", alpha = 0.20) +
+  geom_line(colour = "#16A085", linewidth = 0.9) +
+  geom_point(colour = "#16A085", size = 1.8) +
+  geom_vline(xintercept = best_k, linetype = "dashed", colour = "#C0392B") +
+  annotate("label", x = best_k,
+           y = max(knn_cv$results$Accuracy),
+           label = paste0("Optimal k = ", best_k),
+           colour = "#C0392B", size = 3.4) +
+  scale_x_continuous(breaks = seq(1, 31, by = 2)) +
+  theme_minimal(base_size = 11) +
+  labs(title    = "KNN: 10-fold cross-validated accuracy across k",
+       subtitle = paste0("Best CV accuracy = ",
+                         round(max(knn_cv$results$Accuracy), 4),
+                         " at k = ", best_k),
+       x = "Number of neighbours (k)",
+       y = "CV Accuracy")
 ```
+
+### 3.7.2 Fitting the final model
+
+With k chosen, we refit on the full training set and predict the test split. We use `class::knn` directly (Euclidean on the standardised features), which matches the backend caret used during tuning, so the chosen k stays consistent.
+
+```{r model-knn-final}
+set.seed(42)
+knn_pred_factor <- knn(
+  train = X_train_sc,
+  test  = X_test_sc,
+  cl    = factor(y_train),
+  k     = best_k
+)
+
+knn_pred_num <- as.numeric(as.character(knn_pred_factor))
+knn_m        <- get_metrics(knn_pred_num, y_test)
+
+cat("KNN  | Accuracy:",     knn_m["Accuracy"],
+    "| Weighted F1:",       knn_m["Weighted F1"],
+    "| MAE:",               knn_m["MAE"], "\n")
+```
+
+### 3.7.3 Confusion matrix and per-class diagnostics
+
+```{r knn-confmat, fig.cap="**Figure 6:** KNN confusion matrix on the test set. Most mass sits on or one cell off the diagonal, which is what we want for an ordinal target.", fig.height=4.5, fig.width=7.5}
+all_lvls <- sort(unique(c(y_train, y_test)))
+cm_df <- table(
+  Predicted = factor(knn_pred_num, levels = all_lvls),
+  Actual    = factor(y_test,       levels = all_lvls)
+) %>% as.data.frame()
+
+cm_df %>%
+  ggplot(aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, "")), size = 3) +
+  scale_fill_gradient(low = "#FDFEFE", high = "#16A085") +
+  theme_minimal(base_size = 10) +
+  labs(title = paste0("KNN confusion matrix (k = ", best_k, ")"),
+       x = "Actual star rating",
+       y = "Predicted star rating",
+       fill = "Count") +
+  theme(panel.grid      = element_blank(),
+        legend.position = "right")
+```
+
+```{r knn-summary-table}
+# How often does the model land within half a star of the truth?
+adjacent_acc <- mean(abs(knn_pred_num - y_test) <= 0.5)
+
+tibble(
+  Statistic = c("Optimal k (10-fold CV)",
+                "CV accuracy at optimal k",
+                "Test accuracy",
+                "Test weighted F1",
+                "Test ordinal MAE",
+                "Within ±0.5 stars of actual"),
+  Value = c(best_k,
+            round(max(knn_cv$results$Accuracy), 4),
+            round(knn_m["Accuracy"],    4),
+            round(knn_m["Weighted F1"], 4),
+            round(knn_m["MAE"],         4),
+            round(adjacent_acc,         4))
+) %>%
+  kable(caption = "KNN summary on held-out test set") %>%
+  kable_styling(bootstrap_options = c("striped"),
+                full_width = FALSE, font_size = 12)
+```
+
+### 3.7.4 What this says about the data
+
+The chosen k of `r best_k` sits in a sensible middle ground. Small enough that the engineered features (`is_portable`, `is_R32`, `log_capacity`) actually shape the local geometry, large enough that one or two stray neighbours can't flip a prediction. The CV curve in Figure 5 is also fairly flat across the central range of k, which suggests the answer isn't very sensitive to that exact choice.
+
+The number worth flagging in the summary table is the within ±0.5 stars rate, which is well above the strict accuracy. KNN is mostly off by a single half-star step when it does miss, which lines up with how the rating is built in the first place: AS/NZS 3823.4.1 partitions the underlying TCSPF axis into 0.5-wide bands (Standards Australia, 2014), so two technically similar units genuinely can land on either side of a cut point. We'd be more worried if the misclassifications were spread across two or three star jumps, and the confusion matrix shows they aren't.
+
+The portable paradox identified in Section 4.1 also drops out cleanly here. Because `is_portable` was carried in as a binary feature on the same scale as the rest, portables form their own corner of the feature space and KNN reads them as 0 stars without bleeding into the other classes.
+
+Where KNN clearly runs out of road is the high-star tail. With only 35 training units between 6 and 7 stars, there is no dense neighbourhood up there for the algorithm to vote inside, so test points near that region get pulled back toward whichever majority class is closest. This is a familiar weakness of distance-based methods under skewed class counts and it is also the gap we expect Random Forest and XGBoost to close in Sections 3.5 and 3.6, since splitting the space removes the dependence on local density.
+
+So KNN does what a baseline is meant to do. It confirms the feature space genuinely separates classes when there is enough data to draw on, and it points to where a more flexible model still has work to do.
 
 ---
 
