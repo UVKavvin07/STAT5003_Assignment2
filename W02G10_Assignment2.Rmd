@@ -434,7 +434,7 @@ print(table(df_model$c_star_mixed))
 ```
 
 ```{r train-test-split}
-# ── Step 5: Stratified 80/20 train-test split ─────────────────────────────────
+# Step 5: Stratified 80/20 train-test split
 set.seed(42)
 train_idx <- createDataPartition(df_model$c_star_mixed, p = 0.8, list = FALSE)
 train_df  <- df_model[ train_idx, ]
@@ -446,7 +446,7 @@ X_test  <- test_df  %>% select(-c_star_mixed)
 y_train <- train_df$c_star_mixed
 y_test  <- test_df$c_star_mixed
 
-# ── Step 6: Scale for LR and KNN (tree models do not need scaling) ────────────
+# Step 6: Scale for LR and KNN (tree models do not need scaling) 
 X_train_sc <- scale(X_train)
 X_test_sc  <- scale(X_test,
                     center = attr(X_train_sc, "scaled:center"),
@@ -486,7 +486,7 @@ tibble(
 All five models are evaluated consistently using the same helper function below, ensuring fair comparison across accuracy, weighted F1-score, and ordinal MAE.
 
 ```{r metrics-helper}
-# ── Consistent evaluation function used for all 5 models ─────────────────────
+#  Consistent evaluation function used for all 5 models 
 get_metrics <- function(pred, actual) {
   pred_num   <- as.numeric(as.character(pred))
   actual_num <- as.numeric(as.character(actual))
@@ -555,16 +555,153 @@ cat("OLR  | Accuracy:", olr_m["Accuracy"],
 
 ## 3.5 Random Forest
 
-```{r model-rf}
-# set.seed(42)
-# rf_fit  <- randomForest(x = X_train, y = factor(y_train), ntree = 300, mtry = 3, importance = TRUE)
-# rf_pred <- as.numeric(as.character(predict(rf_fit, newdata = X_test)))
-# rf_m    <- get_metrics(rf_pred, y_test)
-# cat("RF   | Accuracy:", rf_m["Accuracy"], "| Weighted F1:", rf_m["Weighted F1"], "| MAE:", rf_m["MAE"], "\n")
+Random Forests (Breiman, 2001) are an ensemble of decision trees built on bootstrap samples of the training data. At each split, the algorithm only considers a random subset of predictors, which decorrelates trees and reduces variance. This is a good match for our problem because:
 
-# Placeholder so report knits until section is complete
-rf_pred <- rep(median(y_test), length(y_test))
-rf_m    <- get_metrics(rf_pred, y_test)
+- The relationship between technical specifications and star ratings is clearly **non-linear** (e.g., AEER interacts with configuration and refrigerant).
+- Our engineered binary flags (e.g., `is_portable`) can create **hard rule-like boundaries** that trees capture naturally.
+- Unlike logistic regression and KNN, Random Forest does **not** require feature scaling and is robust to outliers in the predictors.
+
+### 3.5.1 Tuning strategy (OOB)
+
+The main hyperparameter we tune is `mtry`, the number of predictors randomly considered at each split. Instead of doing a full cross-validation (which is expensive for large forests), we use the Random Forest **out-of-bag (OOB)** estimate: for each tree, about one-third of observations are not used in its bootstrap sample, so they act like an internal validation set. We select the `mtry` value with the highest OOB accuracy on the training data, then refit a larger forest using that setting.
+
+```{r model-rf}
+# Random Forest: tune `mtry` with OOB accuracy
+set.seed(42)
+
+# Random Forest is scale-invariant, so we use unscaled features `X_train`/`X_test`.
+X_train_df <- as.data.frame(X_train)
+X_test_df  <- as.data.frame(X_test)
+
+y_train_factor <- factor(y_train)
+p <- ncol(X_train_df)
+
+# Small, sensible grid for computational efficiency.
+mtry_grid <- unique(pmax(1, pmin(p, round(c(sqrt(p), 2, p / 2, p)))))
+mtry_grid <- sort(mtry_grid)
+
+tune_tbl <- lapply(mtry_grid, function(mtry_i) {
+  rf_tmp <- randomForest(
+    x = X_train_df,
+    y = y_train_factor,
+    ntree = 400,
+    mtry = mtry_i,
+    importance = FALSE
+  )
+  # Out-Of-Box (OOB) confusion matrix gives an internal OOB estimate of accuracy.
+  conf <- rf_tmp$confusion
+  oob_acc <- sum(diag(conf)) / sum(conf)
+  tibble(mtry = mtry_i, OOB_Accuracy = oob_acc)
+})
+tune_tbl <- bind_rows(tune_tbl) %>% arrange(desc(OOB_Accuracy))
+
+best_mtry <- tune_tbl$mtry[1]
+
+cat(
+  "Random Forest: tuned mtry =", best_mtry,
+  "| best OOB accuracy =", round(tune_tbl$OOB_Accuracy[1], 4), "\n"
+)
+
+# Fit final model with feature importance enabled.
+rf_final <- randomForest(
+  x = X_train_df,
+  y = y_train_factor,
+  ntree = 800,
+  mtry = best_mtry,
+  importance = TRUE
+)
+
+# Predict on held-out test set.
+rf_pred_factor <- predict(rf_final, newdata = X_test_df)
+rf_pred_num <- as.numeric(as.character(rf_pred_factor))
+
+rf_m <- get_metrics(rf_pred_num, y_test)
+cat(
+  "RF   | Accuracy:", rf_m["Accuracy"],
+  "| Weighted F1:", rf_m["Weighted F1"],
+  "| MAE:", rf_m["MAE"], "\n"
+)
+
+```
+
+### 3.5.2 Feature importance
+
+We report Random Forest importance using **Mean Decrease in Gini impurity**. This measures how much each variable tends to reduce node impurity across the forest. It is a useful ranking of predictive signal (especially for screening), but it should be interpreted cautiously because impurity-based importance can favour variables with more split opportunities.
+
+```{r rf-importance, fig.height=4.5, fig.width=8}
+# Feature importance (MeanDecreaseGini)
+rf_imp <- importance(rf_final, type = 2)  # type=2 => MeanDecreaseGini
+rf_imp_df <- as.data.frame(rf_imp) %>%
+  rownames_to_column("Feature")
+
+# `importance()` typically returns a 1-column matrix, but the column name can vary.
+if (!("MeanDecreaseGini" %in% names(rf_imp_df))) {
+  names(rf_imp_df)[2] <- "MeanDecreaseGini"
+}
+
+rf_imp_df <- rf_imp_df %>% arrange(desc(MeanDecreaseGini))
+
+top_k <- min(12, nrow(rf_imp_df))
+
+rf_imp_df %>%
+  slice_head(n = top_k) %>%
+  ggplot(aes(x = fct_reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_col(fill = "#27AE60") +
+  coord_flip() +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "Random Forest Feature Importance",
+    subtitle = paste0("Top ", top_k, " variables | tuned mtry = ", best_mtry),
+    x = NULL, y = "MeanDecreaseGini"
+  )
+```
+
+### 3.5.3 Error structure (ordinal target)
+
+Because `c_star_mixed` is ordinal in 0.5-star steps, we care not only about exact hits but also whether errors are “close”. The confusion matrix helps us see whether misclassifications concentrate on or near the diagonal (off by ±0.5 or ±1.0 stars), which is typically acceptable behaviour for an ordinal label built from threshold bands.
+
+```{r rf-confmat, fig.cap="**Figure:** Random Forest confusion matrix on the test set.", fig.height=4.8, fig.width=7.2}
+# Confusion matrix (Predicted vs Actual)
+all_lvls <- sort(unique(c(y_train, y_test)))
+
+cm_df <- table(
+  Predicted = factor(rf_pred_num, levels = all_lvls),
+  Actual    = factor(y_test,      levels = all_lvls)
+) %>% as.data.frame()
+
+cm_df %>%
+  ggplot(aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, "")), size = 3) +
+  scale_fill_gradient(low = "#FDFEFE", high = "#27AE60") +
+  theme_minimal(base_size = 10) +
+  labs(
+    title = paste0("RF confusion matrix (mtry = ", best_mtry, ")"),
+    x = "Actual star rating",
+    y = "Predicted star rating",
+    fill = "Count"
+  ) +
+  theme(panel.grid = element_blank(),
+        legend.position = "right")
+```
+
+Finally, we compare the predicted and actual class distributions on the test set. Large mismatches here can indicate that the model is collapsing rare classes into the majority band (a common failure mode under class imbalance), even if overall accuracy looks reasonable.
+
+```{r rf-pred-dist, fig.height=3.5, fig.width=9}
+# Predicted vs actual distribution on the test set
+tibble(
+  value = c(y_test, rf_pred_num),
+  type  = rep(c("Actual", "Predicted"), each = length(y_test))
+) %>%
+  count(type, value) %>%
+  ggplot(aes(x = factor(value), y = n, fill = type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Actual" = "#2980B9", "Predicted" = "#27AE60")) +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "Random Forest: Predicted vs Actual Class Distribution (Test Set)",
+    x = "Star Rating (c_star_mixed)", y = "Count", fill = NULL
+  )
 ```
 
 ## 3.6 XGBoost
