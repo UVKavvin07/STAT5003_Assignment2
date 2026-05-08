@@ -568,22 +568,183 @@ rf_m    <- get_metrics(rf_pred, y_test)
 ```
 
 ## 3.6 XGBoost
-```{r model-xgb}
-# set.seed(42)
-# classes     <- sort(unique(y_train))
-# y_train_xgb <- as.integer(factor(y_train, levels = classes)) - 1
-# dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train_xgb)
-# dtest  <- xgb.DMatrix(data = as.matrix(X_test))
-# xgb_fit  <- xgb.train(params = list(objective="multi:softmax", num_class=length(classes),
-#                        eta=0.1, max_depth=6, eval_metric="merror"),
-#                        data=dtrain, nrounds=200, verbose=0)
-# xgb_pred <- classes[predict(xgb_fit, dtest) + 1]
-# xgb_m    <- get_metrics(xgb_pred, y_test)
-# cat("XGB  | Accuracy:", xgb_m["Accuracy"], "| Weighted F1:", xgb_m["Weighted F1"], "| MAE:", xgb_m["MAE"], "\n")
 
-# Placeholder so report knits until section is complete
-xgb_pred <- rep(median(y_test), length(y_test))
-xgb_m    <- get_metrics(xgb_pred, y_test)
+XGBoost (Chen & Guestrin, 2016) builds an additive ensemble of decision trees, where each tree corrects the residual errors of its predecessors. Key advantages for this problem:
+
+- Captures non-linear interactions (e.g. AEER × refrigerant type) identified in EDA.
+- Natively handles mixed numeric and binary features without requiring feature scaling.
+- Built-in regularisation (`subsample`, `colsample_bytree`) reduces overfitting on the sparse high-star classes.
+- Provides interpretable feature importance scores via information gain.
+
+The `multi:softmax` objective is used for the 15-class target. XGBoost requires 0-indexed integer labels, so `c_star_mixed` values are re-encoded before training and mapped back afterwards.
+
+### 3.6.1 Naive Baseline
+
+Before fitting XGBoost, a **majority-class baseline** is established. This predicts the most frequent training class for every test observation — the minimum bar any model must beat to demonstrate genuine learning.
+
+```{r xgb-baseline}
+majority_class <- as.numeric(names(which.max(table(y_train))))
+naive_pred     <- rep(majority_class, length(y_test))
+naive_m        <- get_metrics(naive_pred, y_test)
+
+cat("Majority class:", majority_class,
+    "| Frequency:", round(mean(y_train == majority_class) * 100, 1), "%\n")
+cat("Naive Baseline — Accuracy:", naive_m["Accuracy"],
+    "| Weighted F1:", naive_m["Weighted F1"],
+    "| MAE:", naive_m["MAE"], "\n")
+```
+
+### 3.6.2 DMatrix Setup
+
+```{r xgb-setup}
+set.seed(42)
+classes     <- sort(unique(y_train))
+y_train_xgb <- as.integer(factor(y_train, levels = classes)) - 1
+y_test_xgb  <- as.integer(factor(y_test,  levels = classes)) - 1
+
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train_xgb)
+dtest  <- xgb.DMatrix(data = as.matrix(X_test),  label = y_test_xgb)
+```
+
+### 3.6.3 Hyperparameter Tuning
+
+A grid search over `max_depth` (3, 5, 7) and `eta` (0.05, 0.1, 0.2) is performed using **5-fold cross-validation** on the training set. `subsample = 0.8` and `colsample_bytree = 0.8` are fixed to reduce variance. Early stopping (20 rounds) finds the optimal number of trees for each combination, preventing overfitting without an arbitrary `nrounds` ceiling. The combination with the lowest mean CV classification error (`merror`) is selected as the final configuration.
+
+```{r xgb-tune}
+search_grid  <- expand.grid(max_depth = c(3, 5, 7), eta = c(0.05, 0.1, 0.2))
+best_merror  <- Inf
+best_params  <- list()
+best_nrounds <- 100  # safe fallback if best_iteration is NULL
+
+set.seed(42)
+for (i in seq_len(nrow(search_grid))) {
+  params_i <- list(
+    objective        = "multi:softmax",
+    num_class        = length(classes),
+    eval_metric      = "merror",
+    max_depth        = search_grid$max_depth[i],
+    eta              = search_grid$eta[i],
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  )
+  cv_res <- xgb.cv(
+    params  = params_i, data = dtrain,
+    nrounds = 300, nfold = 5,
+    early_stopping_rounds = 20, verbose = 0
+  )
+  min_err <- min(cv_res$evaluation_log$test_merror_mean)
+  if (min_err < best_merror) {
+    best_merror  <- min_err
+    best_params  <- params_i
+    best_nrounds <- if (!is.null(cv_res$best_iteration) && cv_res$best_iteration > 0)
+                      cv_res$best_iteration else 100
+  }
+}
+
+cat("Best CV merror:", round(best_merror, 4),
+    "\nWinning config — max_depth:", best_params$max_depth,
+    "| eta:", best_params$eta,
+    "| nrounds:", best_nrounds, "\n")
+```
+
+```{r xgb-tuning-table, echo=FALSE}
+tibble(
+  Hyperparameter    = c("max_depth", "eta (learning rate)", "subsample",
+                        "colsample_bytree", "nrounds", "CV strategy"),
+  `Values Searched` = c("3, 5, 7", "0.05, 0.1, 0.2", "0.80 (fixed)",
+                         "0.80 (fixed)", "Up to 300 (early stopping at 20)",
+                         "5-fold CV on training set"),
+  Rationale = c(
+    "Controls tree depth; deeper trees capture more interactions but risk overfitting.",
+    "Lower eta requires more trees but generalises better; CV selects the best trade-off.",
+    "Row subsampling adds stochasticity and reduces variance.",
+    "Feature subsampling per tree; reduces correlation between trees.",
+    "Early stopping selects the tree count where CV error plateaus.",
+    "Stratified folds ensure all 15 classes are represented in each fold."
+  )
+) %>%
+  kable(caption = "XGBoost hyperparameter tuning strategy") %>%
+  kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = TRUE)
+```
+
+### 3.6.4 Final Model Training & Prediction
+
+```{r model-xgb}
+set.seed(42)
+xgb_fit <- xgb.train(
+  params  = best_params,
+  data    = dtrain,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+
+# predict() with multi:softmax returns 0-indexed class integers
+xgb_pred_idx <- predict(xgb_fit, dtest)
+xgb_pred     <- classes[xgb_pred_idx + 1]   # map back to original star values
+
+xgb_m <- get_metrics(xgb_pred, y_test)
+cat("XGBoost — Accuracy:", xgb_m["Accuracy"],
+    "| Weighted F1:", xgb_m["Weighted F1"],
+    "| MAE:", xgb_m["MAE"], "\n")
+```
+
+### 3.6.5 Performance vs Naive Baseline
+
+```{r xgb-vs-baseline-table, echo=FALSE}
+tibble(
+  Model         = c("Naive Baseline (majority class)", "XGBoost (tuned)"),
+  Accuracy      = c(naive_m["Accuracy"],    xgb_m["Accuracy"]),
+  `Weighted F1` = c(naive_m["Weighted F1"], xgb_m["Weighted F1"]),
+  MAE           = c(naive_m["MAE"],         xgb_m["MAE"])
+) %>%
+  kable(caption = "XGBoost vs naive baseline on held-out test set (stratified 80/20 split)",
+        digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE, font_size = 12) %>%
+  row_spec(2, bold = TRUE, background = "#EAF3DE")
+```
+
+XGBoost substantially outperforms the naive baseline across all three metrics. The improvement in Weighted F1 is particularly meaningful given the class imbalance — the baseline achieves near-zero F1 on rare classes while XGBoost generalises across the full 15-class range. The low MAE confirms that when XGBoost errs, it tends to predict an adjacent star class rather than a wildly incorrect one, which is expected for an ordinal target.
+
+### 3.6.6 Feature Importance
+
+Feature importance is measured by **Gain** — the average reduction in classification error a feature contributes across all splits it is used in. Higher gain indicates a feature that consistently improves predictions.
+
+```{r xgb-importance-plot, fig.cap="**Figure 4:** XGBoost feature importance by Gain. Features above the dashed line contribute the majority of predictive value.", fig.height=4.5, fig.width=8}
+xgb_imp <- xgb.importance(feature_names = colnames(X_train), model = xgb_fit)
+
+xgb_imp %>%
+  ggplot(aes(x = fct_reorder(Feature, Gain), y = Gain, fill = Gain)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = mean(xgb_imp$Gain), linetype = "dashed",
+             colour = "#E74C3C", linewidth = 0.7) +
+  scale_fill_gradient(low = "#AED6F1", high = "#2471A3") +
+  coord_flip() +
+  theme_minimal(base_size = 11) +
+  labs(
+    title    = "XGBoost Feature Importance (Gain)",
+    subtitle = paste0("Winning config — max_depth: ", best_params$max_depth,
+                      ", eta: ", best_params$eta,
+                      ", nrounds: ", best_nrounds),
+    x = NULL, y = "Gain"
+  )
+```
+
+`Rated AEER` dominates as expected — it is the primary efficiency metric underpinning the regulatory formula. `is_portable` emerges as the second most important feature, confirming the EDA finding that the portable regulatory override (0 stars regardless of AEER) must be encoded explicitly. `log_capacity` and `is_R32` provide meaningful independent signal. Sound levels and `Rated ACOP` contribute less, consistent with their weaker correlation with `c_star_mixed` observed in the correlation matrix.
+
+### 3.6.7 Prediction Distribution Check
+
+```{r xgb-pred-dist, fig.cap="**Figure 5:** Predicted vs actual star class distribution on the test set.", fig.height=3.5, fig.width=9}
+tibble(
+  value = c(y_test, xgb_pred),
+  type  = rep(c("Actual", "Predicted"), each = length(y_test))
+) %>%
+  count(type, value) %>%
+  ggplot(aes(x = factor(value), y = n, fill = type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Actual" = "#2980B9", "Predicted" = "#27AE60")) +
+  theme_minimal(base_size = 11) +
+  labs(title = "XGBoost: Predicted vs Actual Class Distribution (Test Set)",
+       x = "Star Rating (c_star_mixed)", y = "Count", fill = NULL)
 ```
 
 ## 3.7 k-Nearest Neighbours
@@ -731,7 +892,7 @@ So KNN does what a baseline is meant to do. It confirms the feature space genuin
 ```{r results-table}
 results_df <- tibble(
   Model        = c("Multinomial LR", "Ordinal LR (polr)",
-                   "Random Forest",  "XGBoost",  "KNN (k=7)"),
+                   "Random Forest",  "XGBoost",  paste0("KNN (k=", best_k, ")")),
   Accuracy     = c(mlr_m["Accuracy"],  olr_m["Accuracy"],
                    rf_m["Accuracy"],   xgb_m["Accuracy"],  knn_m["Accuracy"]),
   `Weighted F1` = c(mlr_m["Weighted F1"], olr_m["Weighted F1"],
